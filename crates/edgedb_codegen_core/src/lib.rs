@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use check_keyword::CheckKeyword;
+use edgedb_protocol::client_message::InputLanguage;
 use edgedb_protocol::codec::CAL_DATE_DURATION;
 use edgedb_protocol::codec::CAL_LOCAL_DATE;
 use edgedb_protocol::codec::CAL_LOCAL_DATETIME;
@@ -27,6 +29,7 @@ use edgedb_protocol::common::Cardinality;
 use edgedb_protocol::common::CompilationOptions;
 use edgedb_protocol::common::IoFormat;
 use edgedb_protocol::descriptors::Descriptor;
+use edgedb_protocol::descriptors::InputShapeElement;
 use edgedb_protocol::descriptors::ShapeElement;
 use edgedb_protocol::descriptors::TupleElement;
 use edgedb_protocol::descriptors::TypePos;
@@ -71,9 +74,12 @@ pub async fn get_descriptor(query: &str) -> Result<CommandDataDescription1> {
 		allow_capabilities,
 		io_format: IoFormat::Binary,
 		expected_cardinality: Cardinality::Many,
+		input_language: InputLanguage::EdgeQL,
 	};
 
-	Ok(connection.parse(&flags, query, &state).await?)
+	Ok(connection
+		.parse(&flags, query, &state, &Arc::new(HashMap::new()))
+		.await?)
 }
 
 /// Get the descriptor synchronously.
@@ -100,7 +106,6 @@ pub fn generate_rust_from_query(
 	let input = descriptor.input.decode()?;
 	let output = descriptor.output.decode()?;
 	let mut tokens: TokenStream = TokenStream::new();
-
 	explore_descriptor(
 		ExploreDescriptorProps::builder()
 			.typedesc(&input)
@@ -142,7 +147,6 @@ pub fn generate_rust_from_query(
 		query_props.push(quote!(#props_ident: &#input_ident));
 		transaction_props.push(quote!(#props_ident: &#input_ident));
 	}
-
 	let token_stream = quote! {
 		pub mod #module_name {
 			use ::edgedb_codegen::exports as #EXPORTS_IDENT;
@@ -165,7 +169,6 @@ pub fn generate_rust_from_query(
 			pub const #QUERY_CONSTANT: &str = #query;
 		}
 	};
-
 	Ok(token_stream)
 }
 
@@ -271,13 +274,14 @@ fn explore_descriptor(
 			}
 		}
 		Descriptor::Scalar(scalar) => {
-			let props = props
-				.into_props()
-				.descriptor(typedesc.get(scalar.base_type_pos).ok())
-				.root_name(root_name)
-				.build();
+			let result = uuid_to_token_name(&scalar.id);
 
-			explore_descriptor(props, tokens)
+			if is_root {
+				tokens.extend(quote!(pub type #root_ident = #result;));
+				Ok(Some(quote!(#root_ident)))
+			} else {
+				Ok(Some(result))
+			}
 		}
 		Descriptor::Tuple(tuple) => {
 			let mut tuple_tokens = Punctuated::<_, Token![,]>::new();
@@ -347,7 +351,7 @@ fn explore_descriptor(
 		}
 		Descriptor::InputShape(object) => {
 			let result = explore_object_shape_descriptor(
-				StructElement::from_shape(&object.elements),
+				StructElement::from_input_shape(&object.elements),
 				typedesc,
 				root_name,
 				is_input,
@@ -376,6 +380,15 @@ fn explore_descriptor(
 		}
 		Descriptor::MultiRange(_) => todo!("`multirange` not in the `edgedb_protocol` crate"),
 		Descriptor::TypeAnnotation(_) => todo!("type annotations are not supported"),
+		Descriptor::Object(_object) => {
+			todo!("object type descriptor")
+		}
+		Descriptor::Compound(_) => {
+			todo!("Compound descriptor")
+		}
+		Descriptor::SQLRow(_) => {
+			todo!("SQLRow descriptor")
+		}
 	}
 }
 
@@ -464,8 +477,9 @@ pub fn explore_object_shape_descriptor(
 
 	Ok(Some(quote!(#root_ident)))
 }
-
+#[derive(Debug)]
 pub enum StructElement<'a> {
+	InputShape(&'a InputShapeElement),
 	Shape(&'a ShapeElement),
 	Tuple(&'a TupleElement),
 }
@@ -473,6 +487,10 @@ pub enum StructElement<'a> {
 impl<'a> StructElement<'a> {
 	pub fn from_shape(elements: &'a [ShapeElement]) -> Vec<StructElement<'a>> {
 		elements.iter().map(From::from).collect::<Vec<_>>()
+	}
+
+	pub fn from_input_shape(elements: &'a [InputShapeElement]) -> Vec<StructElement<'a>> {
+		elements.iter().map(|e| From::from(e)).collect::<Vec<_>>()
 	}
 
 	pub fn from_named_tuple(elements: &'a [TupleElement]) -> Vec<StructElement<'a>> {
@@ -483,6 +501,7 @@ impl<'a> StructElement<'a> {
 		match self {
 			StructElement::Shape(shape) => shape.name.clone(),
 			StructElement::Tuple(tuple) => tuple.name.clone(),
+			StructElement::InputShape(input_shape) => input_shape.name.clone(),
 		}
 	}
 
@@ -490,6 +509,7 @@ impl<'a> StructElement<'a> {
 		match self {
 			StructElement::Shape(shape) => shape.type_pos,
 			StructElement::Tuple(tuple) => tuple.type_pos,
+			StructElement::InputShape(input_shape) => input_shape.type_pos,
 		}
 	}
 
@@ -505,6 +525,9 @@ impl<'a> StructElement<'a> {
 		match self {
 			StructElement::Shape(shape) => shape.cardinality.unwrap_or(Cardinality::NoResult),
 			StructElement::Tuple(_) => Cardinality::NoResult,
+			StructElement::InputShape(input_shape) => {
+				input_shape.cardinality.unwrap_or(Cardinality::NoResult)
+			}
 		}
 	}
 }
@@ -512,6 +535,12 @@ impl<'a> StructElement<'a> {
 impl<'a> From<&'a ShapeElement> for StructElement<'a> {
 	fn from(value: &'a ShapeElement) -> Self {
 		StructElement::Shape(value)
+	}
+}
+
+impl<'a> From<&'a InputShapeElement> for StructElement<'a> {
+	fn from(value: &'a InputShapeElement) -> Self {
+		StructElement::InputShape(value)
 	}
 }
 
